@@ -4,6 +4,15 @@ Enrolls employees from photos/videos, then watches a USB webcam feed and
 opens the door only for authorized faces. Every attempt (granted or denied)
 is logged to a JSON file, and denied attempts trigger a warning + snapshot.
 
+**Quickest start:** once your data is in place (step 2 below),
+```bash
+python run.py
+```
+runs enrollment and then immediately starts live recognition in one command
+— see section 6a. The steps below walk through what each part does, in case
+you want to run enrollment and recognition separately (e.g. re-enrolling
+without restarting the camera).
+
 ## 1. Install
 
 ```bash
