@@ -14,15 +14,52 @@ EMPLOYEES_JSON = os.path.join(BASE_DIR, "employees.json")     # generated/update
 ACCESS_LOG_JSON = os.path.join(BASE_DIR, "access_log.json")   # every open/deny event, appended
 ALERTS_DIR = os.path.join(BASE_DIR, "alerts")                 # snapshots of denied attempts
 
+# ---- Authorization source -------------------------------------------------
+# "yaml" = per-employee access.yaml files (original behavior)
+# "csv"  = single employees_auth.csv file (editable by hand or via dashboard)
+AUTH_SOURCE = "csv"
+AUTH_CSV_FILE = os.path.join(BASE_DIR, "employees_auth.csv")
+AUTH_RELOAD_INTERVAL_SECONDS = 5   # recognize.py reloads auth this often
+
+# ---- Web Dashboard --------------------------------------------------------
+# A lightweight Flask UI to toggle access without touching files.
+# Runs inside recognize.py on a background thread.
+DASHBOARD_ENABLED = True
+DASHBOARD_HOST = "0.0.0.0"         # 0.0.0.0 = reachable from other devices on LAN
+DASHBOARD_PORT = 5000
+DASHBOARD_USERNAME = "admin"
+DASHBOARD_PASSWORD = "changeme"    # change this!
+
 # ---- Enrollment -------------------------------------------------------
 # How many frames to sample from each video per person (spread evenly through the clip)
 VIDEO_SAMPLE_FRAMES = 15
-# Skip a video frame that is too blurry/small to bother encoding
+# Skip a detected face that is too small (in pixels, bounding-box width) to
+# bother encoding -- filters out background/passerby faces in a frame.
 MIN_FACE_SIZE_PX = 40
-# Encoding jitters: averages the encoding over N slightly perturbed crops.
-# More stable/accurate encodings at enrollment time (one-time cost, so fine
-# to keep this higher than you'd use live).
-ENROLL_NUM_JITTERS = 5
+
+# ---- InsightFace model -------------------------------------------------------
+# Model pack name. "buffalo_l" is InsightFace's standard detection+recognition
+# pack (RetinaFace detector + ArcFace 512-d embeddings) -- good accuracy, but
+# its memory footprint is too heavy for a Pi Zero 2 W's 512MB RAM (it will
+# get OOM-killed). "buffalo_s" uses a much smaller SCRFD detector and a
+# lighter recognition model -- noticeably lower memory and faster, at a
+# modest accuracy cost that's fine for a single-person/small-office door.
+INSIGHTFACE_MODEL_NAME = "buffalo_s"
+# ctx_id >= 0 selects a GPU device index if you have onnxruntime-gpu
+# installed and a CUDA GPU available; -1 forces CPU. On a Raspberry Pi
+# (no GPU) this doesn't matter much either way since only the CPU execution
+# provider will be available, but -1 is the more honest setting.
+INSIGHTFACE_CTX_ID = -1
+# Detection input resolution (width, height). Larger = better at finding
+# small/far-away faces but slower and more memory. 640x640 is InsightFace's
+# usual default but is unnecessarily large (and memory-hungry) for a fixed
+# camera pointed at a door from close range -- 320x320 is plenty here and
+# meaningfully lighter on a Pi Zero 2 W. Raise it back up if you need to
+# detect faces from farther away or at an angle.
+INSIGHTFACE_DET_SIZE = (320, 320)
+# Minimum detector confidence for a face to be considered at all (separate
+# from MATCH_TOLERANCE below, which is about *whose* face it is).
+INSIGHTFACE_DET_THRESH = 0.5
 
 # Each employee folder may contain this file to control door access, e.g.:
 #   authorized: true
@@ -38,15 +75,18 @@ DEFAULT_AUTHORIZED_IF_MISSING = False
 #   "http://192.168.1.35:81/stream"   (common for ESP32-CAM style modules)
 #   "rtsp://192.168.1.35:554/stream1" (common for RTSP-capable IP cams)
 # If your camera has a login, embed it: "http://user:pass@192.168.1.35:81/stream"
-CAMERA_SOURCE = "http://192.168.1.35:81/stream"
+CAMERA_SOURCE = "http://192.168.1.204:81/stream"
 FRAME_RESIZE_SCALE = 0.5    # downscale frames for speed (1.0 = full res)
 PROCESS_EVERY_N_FRAMES = 3  # only run detection every Nth frame to save CPU
 
-# Lower = stricter match. With only one person enrolled, false-accepts of
-# strangers are much likelier than false-rejects of you, so bias strict.
-# Start at 0.45; if you personally still get rejected sometimes, raise in
-# steps of 0.02. If strangers still get in, lower in steps of 0.02.
-MATCH_TOLERANCE = 0.45
+# InsightFace embeddings are compared by cosine similarity, not Euclidean
+# distance -- so unlike the old face_recognition tolerance, HIGHER here
+# means STRICTER (the two faces must be more alike to count as a match).
+# With only one person enrolled, false-accepts of strangers are much likelier
+# than false-rejects of you, so bias strict. Start at 0.42; if you personally
+# still get rejected sometimes, lower in steps of 0.02. If strangers still
+# get in, raise in steps of 0.02.
+MATCH_TOLERANCE = 0.42
 
 # Require this many consecutive processed frames to match the SAME person
 # before granting access. Kills one-off misfires from a bad angle/lighting
@@ -58,10 +98,21 @@ CONSECUTIVE_MATCHES_REQUIRED = 4
 MAX_FACES_ALLOWED = 1
 
 # Seconds to wait before re-logging/re-alerting the same person, to avoid spam
-COOLDOWN_SECONDS = 8
+COOLDOWN_SECONDS = 1
 
 # How long (seconds) the door stays "open" per successful match
-DOOR_OPEN_SECONDS = 4
+DOOR_OPEN_SECONDS = 3
+
+# ---- Headless mode -------------------------------------------------------
+# Show a live video window with bounding boxes (needs a display; turn off for
+# a server/Raspberry Pi headless setup or systemd service).
+SHOW_VIDEO_WINDOW = False
+# Save a snapshot .jpg for every denied attempt (unknown / not authorized /
+# multiple people). Turn off if you only want the JSON log, no image files.
+SAVE_SNAPSHOTS = False
+# Print a one-line console message for every granted/denied event, in
+# addition to writing it to access_log.json. Independent of the above two.
+PRINT_EVENTS_TO_CONSOLE = True
 
 # ---- Alerts -------------------------------------------------------
 # Set to True and fill in SMTP details in alerts.py if you want emailed warnings.
@@ -71,3 +122,43 @@ SMTP_PORT = 587
 SMTP_USER = "alerts@example.com"
 SMTP_PASSWORD = "changeme"
 ALERT_RECIPIENTS = ["security@example.com"]
+
+# ---- Liveness / anti-spoofing (blink check) --------------------------------
+# Requires a natural blink to be observed before the door opens, so a
+# printed photo or a phone/tablet screen held up to the camera -- which
+# matches the face encodings just fine -- still can't get in. See
+# liveness.py for how it works. Uses OpenCV's bundled eye cascade, so no
+# extra models/downloads are needed.
+# ---- Liveness / anti-spoofing --------------------------------------------
+# Requires the face to pass a passive anti-spoofing check before the door
+# opens, so a printed photo or a phone/tablet screen held up to the
+# camera -- which matches the face encodings just fine -- still can't get
+# in. Uses a small pretrained CNN ensemble (MiniFASNet, ~1.7MB x2) that
+# looks for print/screen artifacts (moire patterns, flat color, paper/
+# plastic texture) rather than relying on the person blinking, which
+# proved unreliable against a wobbling photo. See anti_spoof.py.
+# Needs: pip install onnxruntime, and the two .onnx files in
+# ANTI_SPOOF_MODEL_DIR (shipped alongside this project).
+ANTI_SPOOF_ENABLED = True
+ANTI_SPOOF_MODEL_DIR = os.path.join(BASE_DIR, "antispoof_models")
+ANTI_SPOOF_REAL_THRESHOLD = 0.6           # min "real" confidence for a frame to count toward the real streak
+ANTI_SPOOF_FAKE_THRESHOLD = 0.6           # min "paper"/"screen" confidence for a frame to count toward the fake streak
+ANTI_SPOOF_CONSECUTIVE_REAL_REQUIRED = 3  # consecutive qualifying processed frames needed to open the door
+ANTI_SPOOF_CONSECUTIVE_FAKE_TO_DENY = 3   # consecutive confident fake frames before logging/alerting a suspected spoof
+
+# ---- Raspberry Pi GPIO (door relay) ---------------------------------------
+
+# ---- Raspberry Pi GPIO (door relay) ---------------------------------------
+# Two-relay actuator, matching the wiring your electrical engineer specified:
+# one relay pulses to open, then (after a hold) the other relay pulses to
+# close. If OPi.GPIO isn't installed/available (e.g. testing on a laptop),
+# open_door() automatically falls back to just printing what it would have
+# done -- no code changes needed to test off-Pi.
+GPIO_ENABLED = True
+GPIO_MODE = "BCM"       # "BCM" (GPIO numbering, e.g. 5) or "BOARD" (physical pin numbering)
+GPIO_PIN_OPEN = 13       # GPIO5 (BCM) / physical pin 29 -- pulses to open the door
+GPIO_PIN_CLOSE = 12      # GPIO6 (BCM) -- pulses to close the door
+
+GPIO_OPEN_PULSE_SECONDS = 1   # how long GPIO_PIN_OPEN stays HIGH
+GPIO_HOLD_SECONDS = 6         # both pins LOW in between (door sits open)
+GPIO_CLOSE_PULSE_SECONDS = 1    # how long GPIO_PIN_CLOSE stays HIGH
