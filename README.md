@@ -4,30 +4,24 @@ Enrolls employees from photos/videos, then watches a USB webcam feed and
 opens the door only for authorized faces. Every attempt (granted or denied)
 is logged to a JSON file, and denied attempts trigger a warning + snapshot.
 
-**Quickest start:** once your data is in place (step 2 below),
-```bash
-python run.py
-```
-runs enrollment and then immediately starts live recognition in one command
-— see section 6a. The steps below walk through what each part does, in case
-you want to run enrollment and recognition separately (e.g. re-enrolling
-without restarting the camera).
-
 ## 1. Install
 
 ```bash
 pip install -r requirements.txt
 ```
 
-`face_recognition` depends on `dlib`, which needs `cmake` and a C++ compiler
-to build. On Ubuntu/Debian:
+Face detection/recognition is powered by
+[InsightFace](https://github.com/deepinsight/insightface) (RetinaFace
+detector + ArcFace embeddings via ONNX Runtime) — no C++ compiler or `dlib`
+build step needed. The first time you run `enroll.py`, `recognize.py`, or
+`run.py`, InsightFace automatically downloads the `buffalo_l` model pack
+(~280 MB) from GitHub to `~/.insightface/models`, so **that first run needs
+internet access**; every run after that uses the local copy.
 
-```bash
-sudo apt-get install -y cmake build-essential
-```
-
-On Windows, installing dlib via pip can be painful — using
-`conda install -c conda-forge dlib` first is usually easier.
+Have an NVIDIA GPU? Install `onnxruntime-gpu` instead of `onnxruntime` (see
+`requirements.txt`) to run detection/recognition on the GPU — `config.py`'s
+`INSIGHTFACE_CTX_ID = 0` already picks the GPU if one's available, and
+falls back to CPU automatically if not.
 
 ## 2. Add your data
 
@@ -149,9 +143,10 @@ Edit `alerts.py`:
 ## 9. Tuning
 
 All thresholds live in `config.py`:
-- `MATCH_TOLERANCE` — lower = stricter matching (fewer false accepts, more false rejects). Default 0.5.
+- `MATCH_TOLERANCE` — InsightFace embeddings are compared by cosine similarity, so **higher = stricter** matching here (fewer false accepts, more false rejects). Default 0.42.
 - `COOLDOWN_SECONDS` — avoids re-triggering/re-alerting for the same person every frame.
 - `PROCESS_EVERY_N_FRAMES` / `FRAME_RESIZE_SCALE` — trade accuracy for CPU/speed.
+- `INSIGHTFACE_DET_SIZE` — detector input resolution; larger catches smaller/farther faces but costs more compute per frame.
 
 ## Notes on accuracy
 
@@ -163,12 +158,12 @@ All thresholds live in `config.py`:
 ### Only one person enrolled, but strangers sometimes get let in
 
 With a single-person database there's nothing for the matcher to actively
-tell "not you" apart from — it's just a distance threshold, so this is the
+tell "not you" apart from — it's just a similarity threshold, so this is the
 most false-accept-prone setup. Two things now help with this directly:
 
-- `MATCH_TOLERANCE` was tightened to `0.45` (from the default `0.5`). If
-  strangers still get matched, lower it further in `0.02` steps until they
-  stop — just re-test that you still get recognized reliably each time.
+- `MATCH_TOLERANCE` defaults to `0.42`. If strangers still get matched,
+  raise it further in `0.02` steps until they stop — just re-test that you
+  still get recognized reliably each time.
 - `CONSECUTIVE_MATCHES_REQUIRED` (default `4`) now requires several
   processed frames in a row to agree before the door opens, instead of
   trusting a single frame. This alone should remove most one-off misfires

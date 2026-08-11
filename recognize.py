@@ -39,11 +39,11 @@ from collections import defaultdict
 from datetime import datetime
 
 import cv2
-import face_recognition
 import numpy as np
 
 import config
 from alerts import open_door, send_warning
+from enroll import get_face_app
 
 
 def load_database():
@@ -66,7 +66,7 @@ def flatten_encodings(encodings_db):
         for enc in enc_list:
             names.append(name)
             encs.append(enc)
-    return names, np.array(encs) if encs else np.empty((0, 128))
+    return names, np.array(encs) if encs else np.empty((0, 512))
 
 
 def log_event(entry):
@@ -76,15 +76,20 @@ def log_event(entry):
         f.write(line + "\n")
 
 
-def match_face(face_encoding, known_names, known_encodings):
-    if len(known_encodings) == 0:
+def match_face(face_embedding, known_names, known_encodings):
+    """
+    face_embedding and every row of known_encodings are L2-normalized 512-d
+    InsightFace embeddings, so their dot product is the cosine similarity
+    (1.0 = identical direction, higher = closer match) -- unlike the old
+    face_recognition distance, higher is better here.
+    """
+    if len(known_encodings) == 0 or face_embedding is None:
         return None, None
-    distances = face_recognition.face_distance(known_encodings, face_encoding)
-    best_idx = int(np.argmin(distances))
-    best_distance = float(distances[best_idx])
-    if best_distance <= config.MATCH_TOLERANCE:
-        confidence = round(1.0 - best_distance, 3)
-        return known_names[best_idx], confidence
+    similarities = known_encodings @ face_embedding
+    best_idx = int(np.argmax(similarities))
+    best_similarity = float(similarities[best_idx])
+    if best_similarity >= config.MATCH_TOLERANCE:
+        return known_names[best_idx], round(best_similarity, 3)
     return None, None
 
 
@@ -100,6 +105,8 @@ def main():
     encodings_db, employees_db = load_database()
     known_names, known_encodings = flatten_encodings(encodings_db)
     print(f"Loaded {len(encodings_db)} people, {len(known_names)} total face samples.")
+
+    face_app = get_face_app()  # loads/downloads the InsightFace model once, up front
 
     video = cv2.VideoCapture(config.CAMERA_SOURCE)
     if not video.isOpened():
@@ -128,23 +135,23 @@ def main():
 
             if frame_count % config.PROCESS_EVERY_N_FRAMES == 0:
                 small = cv2.resize(frame, (0, 0), fx=config.FRAME_RESIZE_SCALE, fy=config.FRAME_RESIZE_SCALE)
-                rgb_small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
 
-                face_locations = face_recognition.face_locations(rgb_small)
-                face_encodings = face_recognition.face_encodings(rgb_small, face_locations)
+                # InsightFace expects a BGR image (same as cv2.imread/VideoCapture
+                # output), so no color-space conversion is needed here.
+                faces = face_app.get(small)
 
                 scale_back = 1.0 / config.FRAME_RESIZE_SCALE
                 now = time.time()
                 keys_seen_this_frame = set()
 
-                if len(face_locations) > config.MAX_FACES_ALLOWED:
+                if len(faces) > config.MAX_FACES_ALLOWED:
                     # Anti-tailgating: more than one person at the door -> never open,
                     # and wipe all in-progress streaks so nobody's partial progress
                     # carries over once the frame is back down to one person.
                     match_streak.clear()
-                    for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
-                        top, right, bottom, left = [int(v * scale_back) for v in (top, right, bottom, left)]
-                        name, _ = match_face(face_encoding, known_names, known_encodings)
+                    for face in faces:
+                        left, top, right, bottom = [int(v * scale_back) for v in face.bbox]
+                        name, _ = match_face(face.normed_embedding, known_names, known_encodings)
                         cv2.rectangle(display_frame, (left, top), (right, bottom), (0, 0, 200), 2)
                         cv2.putText(display_frame, f"{name or 'Unknown'} - multiple people",
                                     (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 200), 2)
@@ -152,19 +159,19 @@ def main():
                     if now - last_event_time.get("multiple_people", 0) > config.COOLDOWN_SECONDS:
                         last_event_time["multiple_people"] = now
                         snapshot_path = save_snapshot(frame, "multiple_people")
-                        send_warning("Multiple people", f"{len(face_locations)} faces detected at once - access denied")
+                        send_warning("Multiple people", f"{len(faces)} faces detected at once - access denied")
                         log_event({
                             "timestamp": datetime.now().isoformat(timespec="seconds"),
                             "name": "Multiple", "status": "denied", "confidence": None,
-                            "reason": f"{len(face_locations)} people detected at once",
+                            "reason": f"{len(faces)} people detected at once",
                             "snapshot": snapshot_path,
                         })
 
                 else:
-                    for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
-                        top, right, bottom, left = [int(v * scale_back) for v in (top, right, bottom, left)]
+                    for face in faces:
+                        left, top, right, bottom = [int(v * scale_back) for v in face.bbox]
 
-                        name, confidence = match_face(face_encoding, known_names, known_encodings)
+                        name, confidence = match_face(face.normed_embedding, known_names, known_encodings)
                         authorized = name is not None and employees_db.get(name, {}).get("authorized", False)
                         key = name if authorized else (f"not_allowed:{name}" if name is not None else "unknown")
 

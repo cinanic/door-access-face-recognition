@@ -17,12 +17,25 @@ ALERTS_DIR = os.path.join(BASE_DIR, "alerts")                 # snapshots of den
 # ---- Enrollment -------------------------------------------------------
 # How many frames to sample from each video per person (spread evenly through the clip)
 VIDEO_SAMPLE_FRAMES = 15
-# Skip a video frame that is too blurry/small to bother encoding
+# Skip a detected face that is too small (in pixels, bounding-box width) to
+# bother encoding -- filters out background/passerby faces in a frame.
 MIN_FACE_SIZE_PX = 40
-# Encoding jitters: averages the encoding over N slightly perturbed crops.
-# More stable/accurate encodings at enrollment time (one-time cost, so fine
-# to keep this higher than you'd use live).
-ENROLL_NUM_JITTERS = 5
+
+# ---- InsightFace model -------------------------------------------------------
+# Model pack name. "buffalo_l" is InsightFace's standard detection+recognition
+# pack (RetinaFace detector + ArcFace 512-d embeddings). Downloaded
+# automatically to ~/.insightface/models on first run, so the machine needs
+# internet access the very first time.
+INSIGHTFACE_MODEL_NAME = "buffalo_l"
+# ctx_id >= 0 selects a GPU device index if you have onnxruntime-gpu
+# installed and a CUDA GPU available; -1 forces CPU.
+INSIGHTFACE_CTX_ID = 0
+# Detection input resolution (width, height). Larger = better at finding
+# small/far-away faces but slower. 640x640 is InsightFace's usual default.
+INSIGHTFACE_DET_SIZE = (640, 640)
+# Minimum detector confidence for a face to be considered at all (separate
+# from MATCH_TOLERANCE below, which is about *whose* face it is).
+INSIGHTFACE_DET_THRESH = 0.5
 
 # Each employee folder may contain this file to control door access, e.g.:
 #   authorized: true
@@ -38,15 +51,18 @@ DEFAULT_AUTHORIZED_IF_MISSING = False
 #   "http://192.168.1.35:81/stream"   (common for ESP32-CAM style modules)
 #   "rtsp://192.168.1.35:554/stream1" (common for RTSP-capable IP cams)
 # If your camera has a login, embed it: "http://user:pass@192.168.1.35:81/stream"
-CAMERA_SOURCE = "http://192.168.1.35:81/stream"
+CAMERA_SOURCE = "http://192.168.1.204:81/stream"
 FRAME_RESIZE_SCALE = 0.5    # downscale frames for speed (1.0 = full res)
 PROCESS_EVERY_N_FRAMES = 3  # only run detection every Nth frame to save CPU
 
-# Lower = stricter match. With only one person enrolled, false-accepts of
-# strangers are much likelier than false-rejects of you, so bias strict.
-# Start at 0.45; if you personally still get rejected sometimes, raise in
-# steps of 0.02. If strangers still get in, lower in steps of 0.02.
-MATCH_TOLERANCE = 0.45
+# InsightFace embeddings are compared by cosine similarity, not Euclidean
+# distance -- so unlike the old face_recognition tolerance, HIGHER here
+# means STRICTER (the two faces must be more alike to count as a match).
+# With only one person enrolled, false-accepts of strangers are much likelier
+# than false-rejects of you, so bias strict. Start at 0.42; if you personally
+# still get rejected sometimes, lower in steps of 0.02. If strangers still
+# get in, raise in steps of 0.02.
+MATCH_TOLERANCE = 0.42
 
 # Require this many consecutive processed frames to match the SAME person
 # before granting access. Kills one-off misfires from a bad angle/lighting
